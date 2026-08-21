@@ -8,8 +8,9 @@ import streamlit as st
 
 from database import (
     verify_login, ROLE_LABELS, get_role_permissions, update_user,
-    check_login_locked, record_failed_login, clear_failed_logins,
-    LOGIN_LOCK_MINUTES, PASSWORD_MIN_LENGTH,
+    check_login_locked, check_ip_locked, check_login_rate,
+    record_failed_login, clear_failed_logins,
+    LOGIN_LOCK_MINUTES, IP_LOCK_MINUTES, PASSWORD_MIN_LENGTH,
 )
 
 ROLE_ICONS = {
@@ -59,6 +60,22 @@ def require_page(page_key: str) -> None:
         st.stop()
 
 
+def _get_client_ip() -> str:
+    """尽力获取客户端 IP：Streamlit Cloud 经代理时解析 X-Forwarded-For / X-Real-IP。
+    旧版 Streamlit 无 st.context 或取不到头时返回空串（调用方自动降级为纯账号级防护）。"""
+    try:
+        headers = st.context.headers
+    except Exception:
+        return ""
+    if not headers:
+        return ""
+    for key in ("X-Forwarded-For", "X-Real-IP", "X-Client-IP"):
+        val = headers.get(key) or ""
+        if val:
+            return val.split(",")[0].strip()
+    return ""
+
+
 def login_form() -> None:
     """渲染登录表单"""
     st.markdown(
@@ -103,13 +120,21 @@ def login_form() -> None:
             st.error("请输入用户名和密码")
         else:
             uname = username.strip()
-            # 防暴力破解：短时间失败次数过多则临时锁定
-            if check_login_locked(uname):
+            client_ip = _get_client_ip()
+            # 防暴力破解三层防护（IP 取不到时自动降级，仅保留账号级锁定）：
+            # 1) IP 熔断：同一网络地址 15 分钟内失败过多则整网锁定
+            if check_ip_locked(client_ip):
+                st.error(f"该网络地址登录失败次数过多，已临时锁定 {IP_LOCK_MINUTES} 分钟，请稍后再试")
+            # 2) IP 限流：短时间内尝试过于频繁则临时拒绝
+            elif check_login_rate(client_ip):
+                st.error("登录尝试过于频繁，请稍候再试")
+            # 3) 账号级锁定：单个账号失败次数过多
+            elif check_login_locked(uname):
                 st.error(f"该账号登录失败次数过多，已临时锁定 {LOGIN_LOCK_MINUTES} 分钟，请稍后再试")
             else:
                 user = verify_login(uname, password)
                 if user:
-                    clear_failed_logins(uname)
+                    clear_failed_logins(uname, client_ip)
                     st.session_state.user = user
                     if user.get("must_change_password"):
                         st.warning("🔒 首次登录需先修改初始密码，请在弹出的窗口中设置新密码。")
@@ -118,7 +143,7 @@ def login_form() -> None:
                         st.success("登录成功，正在进入系统…")
                         st.rerun()
                 else:
-                    record_failed_login(uname)
+                    record_failed_login(uname, client_ip)
                     st.error("用户名或密码错误")
 
     st.markdown("</div>", unsafe_allow_html=True)

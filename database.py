@@ -77,6 +77,10 @@ ROLE_LABELS = {
 # ---------- 登录安全（防暴力破解） ----------
 LOGIN_MAX_ATTEMPTS = 5      # 锁定窗口内允许的最大失败次数
 LOGIN_LOCK_MINUTES = 15     # 锁定窗口（分钟）
+IP_LOCK_MAX_ATTEMPTS = 15   # 熔断：同一 IP 在 IP_LOCK_MINUTES 分钟内失败达到该值则锁定该 IP
+IP_LOCK_MINUTES = 15        # IP 熔断锁定时长（分钟）
+RATE_LIMIT_MAX = 20         # 限流：同一 IP 在 RATE_LIMIT_WINDOW_SECONDS 秒内失败达到该值则临时拒绝
+RATE_LIMIT_WINDOW_SECONDS = 60  # 限流窗口（秒）
 PASSWORD_MIN_LENGTH = 8     # 初始密码/重置密码建议最小长度
 
 
@@ -204,8 +208,21 @@ def _cache_clear(key: str) -> None:
 # ==================== 表结构初始化 ====================
 
 def init_db():
-    """初始化数据库表结构（如果表不存在则创建；已存在则自动补充新列）"""
+    """初始化数据库表结构（如果表不存在则创建；已存在则自动补充新列）
+    全部 DDL/DML 在单个事务中执行，任一步失败整体回滚，避免半初始化状态。"""
     conn = get_connection()
+    try:
+        _init_db_impl(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
+
+
+def _init_db_impl(conn):
+    """执行建表/补列/初始化数据的全部 SQL（事务由 init_db() 统一提交/回滚）"""
     cursor = conn.cursor()
 
     # --- 客户表 ---
@@ -351,9 +368,12 @@ def init_db():
         CREATE TABLE IF NOT EXISTS login_attempts (
             id           SERIAL PRIMARY KEY,
             username     TEXT NOT NULL,
+            ip_address   VARCHAR(45) DEFAULT '',
             attempted_at TIMESTAMP NOT NULL DEFAULT NOW()
         )
     """)
+    # 兼容已有库：补充 ip_address 列（IP 级限流/熔断用）
+    cursor.execute("ALTER TABLE login_attempts ADD COLUMN IF NOT EXISTS ip_address VARCHAR(45) DEFAULT ''")
     # 定期清理超过 24 小时的失败记录，防止表无限增长
     cursor.execute("DELETE FROM login_attempts WHERE attempted_at < NOW() - INTERVAL '24 hours'")
 
@@ -376,6 +396,21 @@ def init_db():
     """)
     # 兼容已有库：补充 schedule_id 列（反馈自动扣课时防重复用）
     cursor.execute("ALTER TABLE course_records ADD COLUMN IF NOT EXISTS schedule_id INTEGER")
+    # 幂等性兜底：同一课表只允许一条自动消课记录。
+    # 部分唯一索引（仅对非空 schedule_id 生效，手动消课存 NULL 不受限）。
+    # 先清理历史重复（保留 id 最小的一条），再建索引，避免旧库建索引失败。
+    cursor.execute("""
+        DELETE FROM course_records a
+        USING course_records b
+        WHERE a.schedule_id IS NOT NULL
+          AND a.schedule_id = b.schedule_id
+          AND a.id > b.id
+    """)
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_course_records_schedule
+            ON course_records(schedule_id)
+            WHERE schedule_id IS NOT NULL
+    """)
 
     # --- 课程表 ---
     cursor.execute("""
@@ -510,9 +545,7 @@ def init_db():
         "UPDATE course_packages SET status='已到期', updated_at=TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS') "
         "WHERE status='进行中' AND expiry_date < TO_CHAR(CURRENT_DATE, 'YYYY-MM-DD')"
     )
-
-    conn.commit()
-    release_connection(conn)
+    # 事务由 init_db() 统一 commit/rollback
 
 
 def get_role_permissions(role: str) -> Dict[str, bool]:
@@ -535,19 +568,24 @@ def get_role_permissions(role: str) -> Dict[str, bool]:
 
 
 def save_role_permissions(role: str, mapping: Dict[str, bool]) -> None:
-    """全量保存角色权限映射"""
+    """全量保存角色权限映射（先删后插，单事务，失败整体回滚）"""
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM role_permissions WHERE role = %s", (role,))
-    for key, allowed in mapping.items():
-        if key not in PERMISSION_FLAT:
-            continue
-        cursor.execute(
-            "INSERT INTO role_permissions (role, resource_key, allowed) VALUES (%s, %s, %s)",
-            (role, key, bool(allowed)),
-        )
-    conn.commit()
-    release_connection(conn)
+    try:
+        cursor.execute("DELETE FROM role_permissions WHERE role = %s", (role,))
+        for key, allowed in mapping.items():
+            if key not in PERMISSION_FLAT:
+                continue
+            cursor.execute(
+                "INSERT INTO role_permissions (role, resource_key, allowed) VALUES (%s, %s, %s)",
+                (role, key, bool(allowed)),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 # ==================== 客户 CRUD ====================
@@ -556,21 +594,26 @@ def add_customer(name: str, phone: str = "", wechat: str = "", source: str = "�
                  lifecycle_stage: str = "新线索",
                  notes: str = "", intent_fruit: str = "🍏 青苹果",
                  school: str = "", grade: str = "", teacher: str = "") -> int:
-    """新增客户，返回新客户ID（时间戳由数据库 NOW() 生成，确保时区一致）"""
+    """新增客户，返回新客户ID（时间戳由数据库 NOW() 生成，确保时区一致；单事务）"""
     conn = get_connection()
     cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cursor.execute("""
-        INSERT INTO customers (name, phone, wechat, source, intent_fruit, lifecycle_stage,
-                               school, grade, teacher, notes, created_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'), TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
-        RETURNING id
-    """, (name, phone, wechat, source, intent_fruit, lifecycle_stage,
-          school, grade, teacher, notes))
-    new_id = cursor.fetchone()["id"]
-    conn.commit()
-    release_connection(conn)
-    return new_id
+    try:
+        cursor.execute("""
+            INSERT INTO customers (name, phone, wechat, source, intent_fruit, lifecycle_stage,
+                                   school, grade, teacher, notes, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'), TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
+            RETURNING id
+        """, (name, phone, wechat, source, intent_fruit, lifecycle_stage,
+              school, grade, teacher, notes))
+        new_id = cursor.fetchone()["id"]
+        conn.commit()
+        return new_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 def update_customer(customer_id: int, **kwargs) -> bool:
@@ -583,21 +626,31 @@ def update_customer(customer_id: int, **kwargs) -> bool:
     set_clause = ", ".join([f"{k} = %s" for k in data.keys()])
     values = list(data.values()) + [customer_id]
     conn = get_connection()
-    conn.cursor().execute(
-        f"UPDATE customers SET {set_clause}, updated_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS') WHERE id = %s", values
-    )
-    conn.commit()
-    release_connection(conn)
-    return True
+    try:
+        conn.cursor().execute(
+            f"UPDATE customers SET {set_clause}, updated_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS') WHERE id = %s", values
+        )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 def delete_customer(customer_id: int) -> bool:
-    """删除客户及其关联跟进记录（级联删除由外键 ON DELETE CASCADE 自动处理）"""
+    """删除客户及其关联跟进记录（级联删除由外键 ON DELETE CASCADE 自动处理；单事务）"""
     conn = get_connection()
-    conn.cursor().execute("DELETE FROM customers WHERE id = %s", (customer_id,))
-    conn.commit()
-    release_connection(conn)
-    return True
+    try:
+        conn.cursor().execute("DELETE FROM customers WHERE id = %s", (customer_id,))
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 def get_all_customers(search: str = "", stage_filter: str = "",
@@ -655,12 +708,15 @@ def add_user(username: str, password: str, display_name: str, role: str = "staff
     except psycopg2.errors.UniqueViolation:
         conn.rollback()
         return False
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         release_connection(conn)
 
 
 def update_user(user_id: int, **kwargs) -> bool:
-    """更新用户信息（密码、显示名、角色、强制改密标记），密码需传明文自动哈希"""
+    """更新用户信息（密码、显示名、角色、强制改密标记），密码需传明文自动哈希（单事务）"""
     if not kwargs:
         return False
     data = _filter_update_fields("users", kwargs)
@@ -671,29 +727,39 @@ def update_user(user_id: int, **kwargs) -> bool:
     set_clause = ", ".join([f"{k} = %s" for k in data.keys()])
     values = list(data.values()) + [user_id]
     conn = get_connection()
-    conn.cursor().execute(f"UPDATE users SET {set_clause} WHERE id = %s", values)
-    conn.commit()
-    _cache_clear("all_users")
-    release_connection(conn)
-    return True
+    try:
+        conn.cursor().execute(f"UPDATE users SET {set_clause} WHERE id = %s", values)
+        conn.commit()
+        _cache_clear("all_users")
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 def delete_user(user_id: int) -> bool:
-    """删除用户，且不能删除 admin 管理员"""
+    """删除用户，且不能删除 admin 管理员（单事务：删用户 + 清空其名下客户学管）"""
     conn = get_connection()
     cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cursor.execute("SELECT username FROM users WHERE id = %s", (user_id,))
-    row = cursor.fetchone()
-    if not row or row["username"] == "admin":
+    try:
+        cursor.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+        row = cursor.fetchone()
+        if not row or row["username"] == "admin":
+            conn.rollback()
+            return False
+        cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
+        # 删除用户后，将其名下客户学管置空，避免孤儿数据
+        cursor.execute("UPDATE customers SET teacher = '' WHERE teacher = %s", (row["username"],))
+        conn.commit()
+        _cache_clear("all_users")
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
         release_connection(conn)
-        return False
-    cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
-    # 删除用户后，将其名下客户学管置空，避免孤儿数据
-    cursor.execute("UPDATE customers SET teacher = '' WHERE teacher = %s", (row["username"],))
-    conn.commit()
-    _cache_clear("all_users")
-    release_connection(conn)
-    return True
 
 
 def get_all_users() -> List[Dict[str, Any]]:
@@ -742,6 +808,9 @@ def verify_login(username: str, password: str) -> Optional[Dict[str, Any]]:
         result.pop("password", None)
         result["must_change_password"] = bool(result.get("must_change_password"))
         return result
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         release_connection(conn)
 
@@ -763,24 +832,70 @@ def check_login_locked(username: str) -> bool:
         release_connection(conn)
 
 
-def record_failed_login(username: str) -> None:
-    """记录一次登录失败"""
+def check_ip_locked(ip: str) -> bool:
+    """熔断：同一 IP 在 IP_LOCK_MINUTES 分钟内失败次数达到上限则锁定该 IP。
+    IP 为空时跳过（降级为纯账号级防护）。"""
+    if not ip:
+        return False
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO login_attempts (username) VALUES (%s)", (username,))
-        conn.commit()
+        cursor.execute(
+            "SELECT COUNT(*) FROM login_attempts WHERE ip_address = %s "
+            "AND attempted_at > NOW() - make_interval(mins => %s)",
+            (ip, IP_LOCK_MINUTES),
+        )
+        return cursor.fetchone()[0] >= IP_LOCK_MAX_ATTEMPTS
     finally:
         release_connection(conn)
 
 
-def clear_failed_logins(username: str) -> None:
-    """登录成功后清除该用户的失败记录"""
+def check_login_rate(ip: str) -> bool:
+    """限流：同一 IP 在 RATE_LIMIT_WINDOW_SECONDS 秒内失败次数达到上限则临时拒绝。
+    IP 为空时跳过（降级为纯账号级防护）。"""
+    if not ip:
+        return False
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT COUNT(*) FROM login_attempts WHERE ip_address = %s "
+            "AND attempted_at > NOW() - make_interval(secs => %s)",
+            (ip, RATE_LIMIT_WINDOW_SECONDS),
+        )
+        return cursor.fetchone()[0] >= RATE_LIMIT_MAX
+    finally:
+        release_connection(conn)
+
+
+def record_failed_login(username: str, ip: str = "") -> None:
+    """记录一次登录失败（含来源 IP，单事务）"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "INSERT INTO login_attempts (username, ip_address) VALUES (%s, %s)",
+            (username, ip or ""),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
+
+
+def clear_failed_logins(username: str, ip: str = "") -> None:
+    """登录成功后清除该用户的失败记录（单事务）。
+    注：IP 维度失败计数独立保留，避免同网段某人成功登录即清空共享 IP 的熔断累计。"""
     conn = get_connection()
     cursor = conn.cursor()
     try:
         cursor.execute("DELETE FROM login_attempts WHERE username = %s", (username,))
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         release_connection(conn)
 
@@ -789,26 +904,31 @@ def clear_failed_logins(username: str) -> None:
 
 def add_follow_up(customer_id: int, follow_type: str, content: str, plan_time: str,
                   status: str = "待跟进") -> int:
-    """新增跟进记录（时间戳由数据库 NOW() 生成），同时刷新客户更新时间"""
+    """新增跟进记录（时间戳由数据库 NOW() 生成），同时刷新客户更新时间（单事务）"""
     conn = get_connection()
     cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cursor.execute("""
-        INSERT INTO follow_ups (customer_id, follow_type, content, plan_time, status,
-                                created_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s,
-                TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'),
-                TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
-        RETURNING id
-    """, (customer_id, follow_type, content, plan_time, status))
-    new_id = cursor.fetchone()["id"]
-    # 同步刷新客户更新时间
-    cursor.execute(
-        "UPDATE customers SET updated_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS') WHERE id = %s",
-        (customer_id,)
-    )
-    conn.commit()
-    release_connection(conn)
-    return new_id
+    try:
+        cursor.execute("""
+            INSERT INTO follow_ups (customer_id, follow_type, content, plan_time, status,
+                                    created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s,
+                    TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'),
+                    TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
+            RETURNING id
+        """, (customer_id, follow_type, content, plan_time, status))
+        new_id = cursor.fetchone()["id"]
+        # 同步刷新客户更新时间
+        cursor.execute(
+            "UPDATE customers SET updated_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS') WHERE id = %s",
+            (customer_id,)
+        )
+        conn.commit()
+        return new_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 def update_follow_up(follow_id: int, **kwargs) -> bool:
@@ -831,24 +951,34 @@ def update_follow_up(follow_id: int, **kwargs) -> bool:
     set_clause = ", ".join([f"{k} = %s" for k in data.keys()])
     set_clause += ", updated_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS')"
     values = list(data.values()) + [follow_id]
-    cursor.execute(f"UPDATE follow_ups SET {set_clause} WHERE id = %s", values)
-    # 同步刷新客户更新时间
-    cursor.execute(
-        "UPDATE customers SET updated_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS') WHERE id = %s",
-        (customer_id,)
-    )
-    conn.commit()
-    release_connection(conn)
-    return True
+    try:
+        cursor.execute(f"UPDATE follow_ups SET {set_clause} WHERE id = %s", values)
+        # 同步刷新客户更新时间
+        cursor.execute(
+            "UPDATE customers SET updated_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS') WHERE id = %s",
+            (customer_id,)
+        )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 def delete_follow_up(follow_id: int) -> bool:
-    """删除跟进记录"""
+    """删除跟进记录（单事务）"""
     conn = get_connection()
-    conn.cursor().execute("DELETE FROM follow_ups WHERE id = %s", (follow_id,))
-    conn.commit()
-    release_connection(conn)
-    return True
+    try:
+        conn.cursor().execute("DELETE FROM follow_ups WHERE id = %s", (follow_id,))
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 def get_follow_ups(customer_id: Optional[int] = None, status: str = "",
@@ -901,23 +1031,28 @@ def add_course_package(customer_id: int, package_name: str, total_hours: float,
     pkg_type       : 课时包类型（1v1 一对一 / 1v多 一对多）"""
     conn = get_connection()
     cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cursor.execute("""
-        INSERT INTO course_packages (customer_id, package_name, total_hours, used_hours,
-            purchase_date, expiry_date, price, original_price, discount_amount, unit_price,
-            status, notes, type, created_at, updated_at)
-        VALUES (%s, %s, %s, 0, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'), TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
-        RETURNING id
-    """, (customer_id, package_name, total_hours, purchase_date, expiry_date,
-          price, original_price, discount_amount, unit_price, status, notes, pkg_type))
-    new_id = cursor.fetchone()["id"]
-    conn.commit()
-    release_connection(conn)
-    return new_id
+    try:
+        cursor.execute("""
+            INSERT INTO course_packages (customer_id, package_name, total_hours, used_hours,
+                purchase_date, expiry_date, price, original_price, discount_amount, unit_price,
+                status, notes, type, created_at, updated_at)
+            VALUES (%s, %s, %s, 0, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'), TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
+            RETURNING id
+        """, (customer_id, package_name, total_hours, purchase_date, expiry_date,
+              price, original_price, discount_amount, unit_price, status, notes, pkg_type))
+        new_id = cursor.fetchone()["id"]
+        conn.commit()
+        return new_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 def update_course_package(package_id: int, **kwargs) -> bool:
-    """更新课时包（字段名受白名单约束，updated_at 由数据库 NOW() 自动设置）"""
+    """更新课时包（字段名受白名单约束，updated_at 由数据库 NOW() 自动设置；单事务）"""
     if not kwargs:
         return False
     data = _filter_update_fields("course_packages", kwargs)
@@ -926,21 +1061,31 @@ def update_course_package(package_id: int, **kwargs) -> bool:
     set_clause = ", ".join([f"{k} = %s" for k in data.keys()])
     values = list(data.values()) + [package_id]
     conn = get_connection()
-    conn.cursor().execute(
-        f"UPDATE course_packages SET {set_clause}, updated_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS') WHERE id = %s", values
-    )
-    conn.commit()
-    release_connection(conn)
-    return True
+    try:
+        conn.cursor().execute(
+            f"UPDATE course_packages SET {set_clause}, updated_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS') WHERE id = %s", values
+        )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 def delete_course_package(package_id: int) -> bool:
-    """删除课时包（级联删除消课记录由外键 ON DELETE CASCADE 自动处理）"""
+    """删除课时包（级联删除消课记录由外键 ON DELETE CASCADE 自动处理；单事务）"""
     conn = get_connection()
-    conn.cursor().execute("DELETE FROM course_packages WHERE id = %s", (package_id,))
-    conn.commit()
-    release_connection(conn)
-    return True
+    try:
+        conn.cursor().execute("DELETE FROM course_packages WHERE id = %s", (package_id,))
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 def get_course_packages(customer_id: int = 0, status: str = "", teacher: str = "") -> List[Dict[str, Any]]:
@@ -1124,38 +1269,77 @@ def add_course_package_template(name: str, total_hours: float, price: float = 0,
     pkg_type: 课时包类型（1v1 一对一 / 1v多 一对多）"""
     conn = get_connection()
     cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cursor.execute("""
-        INSERT INTO course_package_templates (name, total_hours, price, grade, status, type, created_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'), TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
-        RETURNING id
-    """, (name, total_hours, price, grade, status, pkg_type))
-    new_id = cursor.fetchone()["id"]
-    conn.commit()
-    release_connection(conn)
-    return new_id
+    try:
+        cursor.execute("""
+            INSERT INTO course_package_templates (name, total_hours, price, grade, status, type, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'), TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
+            RETURNING id
+        """, (name, total_hours, price, grade, status, pkg_type))
+        new_id = cursor.fetchone()["id"]
+        conn.commit()
+        return new_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 def delete_course_package_template(template_id: int) -> bool:
-    """删除课时包模板"""
+    """删除课时包模板（单事务）"""
     conn = get_connection()
-    conn.cursor().execute("DELETE FROM course_package_templates WHERE id = %s", (template_id,))
-    conn.commit()
-    release_connection(conn)
-    return True
+    try:
+        conn.cursor().execute("DELETE FROM course_package_templates WHERE id = %s", (template_id,))
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 # ==================== 消课记录 CRUD ====================
 
-def add_course_record(package_id: int, customer_id: int, record_date: str,
-                       hours_used: float = 1, course_type: str = "1v1",
-                       teacher: str = "", notes: str = "",
-                       schedule_id: int = 0) -> int:
-    """新增消课记录，同时自动更新课时包的 used_hours（时间戳由数据库 NOW() 生成）
-    schedule_id: 关联课表 ID（课堂反馈自动扣课时时传入，用于防重复扣减；0 表示手动消课）
-    """
-    conn = get_connection()
-    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+def _refresh_customer_stage_by_hours(cursor, customer_id: int, renew: bool = False):
+    """根据客户全部「进行中」课时包的剩余课时，同步其生命周期阶段（在调用方事务内执行，不负责 commit）。
+    与消课流程共用阈值：剩余 ≤ 0 → 流失；0 < 剩余 < 10 → 待续费；剩余 ≥ 10 → 在读。
+    renew=False（消课后调用）：仅做降级校正——归零转「流失」（限在读/待续费）、
+       课时不足转「待续费」（仅限在读），课时充足时不干预，保留人工设置的状态。
+    renew=True（续费后调用）：强制校正——课时充足转回「在读」、不足转「待续费」、
+       归零转「流失」（均限在读/待续费，不覆盖其他人工阶段）。"""
+    cursor.execute("""
+        SELECT COALESCE(SUM(total_hours - used_hours), 0)::float AS remaining
+        FROM course_packages
+        WHERE customer_id = %s AND status = '进行中'
+    """, (customer_id,))
+    row = cursor.fetchone()
+    if row is None:
+        return
+    remaining = float(row["remaining"])
+    if remaining <= 0:
+        new_stage, scope = "流失", "('在读', '待续费')"
+    elif remaining < 10:
+        new_stage = "待续费"
+        scope = "('在读', '待续费')" if renew else "('在读',)"
+    else:
+        if not renew:
+            return  # 消课场景课时充足时不干预，保留人工状态
+        new_stage, scope = "在读", "('在读', '待续费')"
+    cursor.execute(f"""
+        UPDATE customers SET lifecycle_stage = %s,
+            updated_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS')
+        WHERE id = %s AND lifecycle_stage IN {scope}
+    """, (new_stage, customer_id))
 
+
+def _insert_course_record(cursor, package_id: int, customer_id: int, record_date: str,
+                          hours_used: float, course_type: str, teacher: str,
+                          notes: str, schedule_id: int = 0) -> int:
+    """在指定 cursor 上执行消课的全部 SQL（写记录 + 更新课时包 + 状态 + 生命周期）。
+    不负责 commit/rollback，由调用方统一管理事务——
+    这样手动消课（add_course_record）与课堂反馈批量扣减（auto_consume_hours_by_feedback）
+    可以共享同一段核心逻辑，且批量扣减时全班学员在同一个事务内原子提交/回滚。"""
     # 1. 写入消课记录
     cursor.execute("""
         INSERT INTO course_records (package_id, customer_id, record_date, hours_used,
@@ -1166,12 +1350,16 @@ def add_course_record(package_id: int, customer_id: int, record_date: str,
           schedule_id if schedule_id else None))
     record_id = cursor.fetchone()["id"]
 
-    # 2. 更新课时包已消耗课时
+    # 2. 更新课时包已消耗课时（乐观锁：条件更新防超扣。
+    #    WHERE 限定 used_hours + 本次 <= total_hours，若并发导致剩余不足
+    #    或课时包已被删除则影响 0 行，抛错由调用方回滚/降级。）
     cursor.execute("""
         UPDATE course_packages SET used_hours = used_hours + %s,
             updated_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS')
-        WHERE id = %s
-    """, (hours_used, package_id))
+        WHERE id = %s AND used_hours + %s <= total_hours + 0.0001
+    """, (hours_used, package_id, hours_used))
+    if cursor.rowcount == 0:
+        raise RuntimeError(f"课时包剩余课时不足（本次需扣 {hours_used} 节）")
 
     # 3. 检查是否用完，自动更新状态
     cursor.execute(
@@ -1184,62 +1372,84 @@ def add_course_record(package_id: int, customer_id: int, record_date: str,
             (package_id,)
         )
 
-    # 4. 课时变化即时更新生命周期（消课瞬间触发）：
-    #    归零（剩余 ≤ 0）        → 立即转「流失」，仅针对在读/待续费学员
-    #    课时不足（0 < 剩余 < 10）→ 转「待续费」，仅针对在读学员（不覆盖人工状态）
-    cursor.execute("""
-        SELECT COALESCE(SUM(total_hours - used_hours), 0)::float AS remaining
-        FROM course_packages
-        WHERE customer_id = %s AND status = '进行中'
-    """, (customer_id,))
-    remaining_row = cursor.fetchone()
-    if remaining_row is not None:
-        remaining = float(remaining_row["remaining"])
-        if remaining <= 0:
-            cursor.execute("""
-                UPDATE customers SET lifecycle_stage = '流失',
-                    updated_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS')
-                WHERE id = %s AND lifecycle_stage IN ('在读', '待续费')
-            """, (customer_id,))
-        elif remaining < 10:
-            cursor.execute("""
-                UPDATE customers SET lifecycle_stage = '待续费',
-                    updated_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS')
-                WHERE id = %s AND lifecycle_stage = '在读'
-            """, (customer_id,))
-
-    conn.commit()
-    release_connection(conn)
+    # 4. 课时变化即时更新生命周期（消课瞬间触发，与续费共用同一套阈值判定）
+    _refresh_customer_stage_by_hours(cursor, customer_id)
     return record_id
 
 
-def delete_course_record(record_id: int) -> bool:
-    """删除消课记录，同时退回课时包的 used_hours"""
+def refresh_customer_stage_by_hours(customer_id: int) -> str:
+    """续费完成后调用：按全部「进行中」课时包剩余课时校正学员生命周期阶段（单事务）。
+    剩余 ≥ 10 → 在读；0 < 剩余 < 10 → 待续费；剩余 ≤ 0 → 流失（仅针对在读/待续费学员）。
+    返回校正后的阶段名（学员不存在时返回空串）。"""
     conn = get_connection()
     cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    # 获取记录信息
-    cursor.execute(
-        "SELECT package_id, hours_used FROM course_records WHERE id = %s", (record_id,)
-    )
-    record = cursor.fetchone()
-    if not record:
+    try:
+        _refresh_customer_stage_by_hours(cursor, customer_id, renew=True)
+        conn.commit()
+        cursor.execute("SELECT lifecycle_stage FROM customers WHERE id = %s", (customer_id,))
+        row = cursor.fetchone()
+        return row["lifecycle_stage"] if row else ""
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
         release_connection(conn)
-        return False
 
-    # 退回课时（PostgreSQL 用 GREATEST 替代 SQLite 的 MAX）
-    cursor.execute("""
-        UPDATE course_packages SET used_hours = GREATEST(0, used_hours - %s),
-            status = CASE WHEN status = '已用完' THEN '进行中' ELSE status END,
-            updated_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS')
-        WHERE id = %s
-    """, (record["hours_used"], record["package_id"]))
 
-    # 删除记录
-    cursor.execute("DELETE FROM course_records WHERE id = %s", (record_id,))
-    conn.commit()
-    release_connection(conn)
-    return True
+def add_course_record(package_id: int, customer_id: int, record_date: str,
+                       hours_used: float = 1, course_type: str = "1v1",
+                       teacher: str = "", notes: str = "",
+                       schedule_id: int = 0) -> int:
+    """新增消课记录，同时自动更新课时包的 used_hours（单事务）
+    schedule_id: 关联课表 ID（课堂反馈自动扣课时时传入，用于防重复扣减；0 表示手动消课）
+    """
+    conn = get_connection()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        record_id = _insert_course_record(
+            cursor, package_id, customer_id, record_date, hours_used,
+            course_type, teacher, notes, schedule_id,
+        )
+        conn.commit()
+        return record_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
+
+
+def delete_course_record(record_id: int) -> bool:
+    """删除消课记录，同时退回课时包的 used_hours（单事务）"""
+    conn = get_connection()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        # 获取记录信息
+        cursor.execute(
+            "SELECT package_id, hours_used FROM course_records WHERE id = %s", (record_id,)
+        )
+        record = cursor.fetchone()
+        if not record:
+            conn.rollback()
+            return False
+
+        # 退回课时（PostgreSQL 用 GREATEST 替代 SQLite 的 MAX）
+        cursor.execute("""
+            UPDATE course_packages SET used_hours = GREATEST(0, used_hours - %s),
+                status = CASE WHEN status = '已用完' THEN '进行中' ELSE status END,
+                updated_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS')
+            WHERE id = %s
+        """, (record["hours_used"], record["package_id"]))
+
+        # 删除记录
+        cursor.execute("DELETE FROM course_records WHERE id = %s", (record_id,))
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 def get_course_records(package_id: int = 0, customer_id: int = 0,
@@ -1560,18 +1770,26 @@ def add_course(name: str, description: str = "") -> bool:
     except psycopg2.errors.UniqueViolation:
         conn.rollback()
         return False
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         release_connection(conn)
 
 
 def delete_course(course_id: int) -> bool:
-    """删除课程（级联删除关联班级、班级学员、课表）"""
+    """删除课程（级联删除关联班级、班级学员、课表；单事务）"""
     conn = get_connection()
-    conn.cursor().execute("DELETE FROM courses WHERE id = %s", (course_id,))
-    conn.commit()
-    _cache_clear("all_courses")
-    release_connection(conn)
-    return True
+    try:
+        conn.cursor().execute("DELETE FROM courses WHERE id = %s", (course_id,))
+        conn.commit()
+        _cache_clear("all_courses")
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 def get_all_courses() -> List[Dict[str, Any]]:
@@ -1613,23 +1831,28 @@ def add_class(name: str, class_type: str = "1v多", course_id: int = 0, teacher:
     """新增班级，返回班级 ID；course_id 可空（课程体系已废弃，班级名即课程名）"""
     conn = get_connection()
     cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cursor.execute("""
-        INSERT INTO classes (name, class_type, course_id, teacher, manager,
-                             max_students, status, start_date, notes, created_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
-                TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'),
-                TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
-        RETURNING id
-    """, (name, class_type, course_id or None, teacher, manager,
-          max_students, status, start_date, notes))
-    new_id = cursor.fetchone()["id"]
-    conn.commit()
-    release_connection(conn)
-    return new_id
+    try:
+        cursor.execute("""
+            INSERT INTO classes (name, class_type, course_id, teacher, manager,
+                                 max_students, status, start_date, notes, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'),
+                    TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
+            RETURNING id
+        """, (name, class_type, course_id or None, teacher, manager,
+              max_students, status, start_date, notes))
+        new_id = cursor.fetchone()["id"]
+        conn.commit()
+        return new_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 def update_class(class_id: int, **kwargs) -> bool:
-    """更新班级信息（字段名受白名单约束，updated_at 由数据库 NOW() 自动设置）"""
+    """更新班级信息（字段名受白名单约束，updated_at 由数据库 NOW() 自动设置；单事务）"""
     if not kwargs:
         return False
     data = _filter_update_fields("classes", kwargs)
@@ -1638,22 +1861,32 @@ def update_class(class_id: int, **kwargs) -> bool:
     set_clause = ", ".join([f"{k} = %s" for k in data.keys()])
     values = list(data.values()) + [class_id]
     conn = get_connection()
-    conn.cursor().execute(
-        f"UPDATE classes SET {set_clause}, updated_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS') WHERE id = %s",
-        values,
-    )
-    conn.commit()
-    release_connection(conn)
-    return True
+    try:
+        conn.cursor().execute(
+            f"UPDATE classes SET {set_clause}, updated_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS') WHERE id = %s",
+            values,
+        )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 def delete_class(class_id: int) -> bool:
-    """删除班级（级联删除班级学员，课表 class_id 置空）"""
+    """删除班级（级联删除班级学员，课表 class_id 置空；单事务）"""
     conn = get_connection()
-    conn.cursor().execute("DELETE FROM classes WHERE id = %s", (class_id,))
-    conn.commit()
-    release_connection(conn)
-    return True
+    try:
+        conn.cursor().execute("DELETE FROM classes WHERE id = %s", (class_id,))
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 def get_all_classes(class_type: str = "", course_id: int = 0, teacher: str = "",
@@ -1718,7 +1951,7 @@ def get_class_by_id(class_id: int) -> Optional[Dict[str, Any]]:
 # ==================== 班级学员 CRUD ====================
 
 def add_class_student(class_id: int, customer_id: int) -> bool:
-    """往班级添加学员（重复添加自动忽略）"""
+    """往班级添加学员（重复添加自动忽略；单事务）"""
     conn = get_connection()
     cursor = conn.cursor()
     try:
@@ -1729,19 +1962,28 @@ def add_class_student(class_id: int, customer_id: int) -> bool:
         """, (class_id, customer_id))
         conn.commit()
         return True
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         release_connection(conn)
 
 
 def remove_class_student(class_id: int, customer_id: int) -> bool:
+    """将学员移出班级（单事务）"""
     conn = get_connection()
-    conn.cursor().execute(
-        "DELETE FROM class_students WHERE class_id = %s AND customer_id = %s",
-        (class_id, customer_id),
-    )
-    conn.commit()
-    release_connection(conn)
-    return True
+    try:
+        conn.cursor().execute(
+            "DELETE FROM class_students WHERE class_id = %s AND customer_id = %s",
+            (class_id, customer_id),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 def get_class_students(class_id: int) -> List[Dict[str, Any]]:
@@ -1788,18 +2030,23 @@ def add_schedule(class_id: int = 0, course_id: int = 0, title: str = "", teacher
     package_id: 排课时指定的课时包（1v1 可选；0 表示自动组合同类型课时包）。"""
     conn = get_connection()
     cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cursor.execute("""
-        INSERT INTO schedules (class_id, course_id, customer_id, title, teacher,
-                               start_time, end_time, location, notes, package_id, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
-        RETURNING id
-    """, (class_id or None, course_id or None, customer_id or None, title, teacher,
-          start_time, end_time, location, notes, package_id or None))
-    new_id = cursor.fetchone()["id"]
-    conn.commit()
-    release_connection(conn)
-    return new_id
+    try:
+        cursor.execute("""
+            INSERT INTO schedules (class_id, course_id, customer_id, title, teacher,
+                                   start_time, end_time, location, notes, package_id, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
+            RETURNING id
+        """, (class_id or None, course_id or None, customer_id or None, title, teacher,
+              start_time, end_time, location, notes, package_id or None))
+        new_id = cursor.fetchone()["id"]
+        conn.commit()
+        return new_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 def add_schedules_bulk(schedules: List[Dict[str, Any]]) -> int:
@@ -1846,11 +2093,17 @@ def add_schedules_bulk(schedules: List[Dict[str, Any]]) -> int:
 
 
 def delete_schedule(schedule_id: int) -> bool:
+    """删除课表记录（单事务）"""
     conn = get_connection()
-    conn.cursor().execute("DELETE FROM schedules WHERE id = %s", (schedule_id,))
-    conn.commit()
-    release_connection(conn)
-    return True
+    try:
+        conn.cursor().execute("DELETE FROM schedules WHERE id = %s", (schedule_id,))
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 def get_schedules(date_from: str = "", date_to: str = "", teacher: str = "",
@@ -1931,20 +2184,25 @@ def get_schedule_feedback(schedule_id: int) -> str:
 
 
 def save_schedule_feedback(schedule_id: int, teacher: str, content: str) -> bool:
-    """保存课堂反馈（已存在则更新）"""
+    """保存课堂反馈（已存在则更新；单事务）"""
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO schedule_feedback (schedule_id, teacher, content, created_at, updated_at)
-        VALUES (%s, %s, %s, TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'), TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
-        ON CONFLICT (schedule_id) DO UPDATE SET
-            content = EXCLUDED.content,
-            teacher = EXCLUDED.teacher,
-            updated_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS')
-    """, (schedule_id, teacher, content))
-    conn.commit()
-    release_connection(conn)
-    return True
+    try:
+        cursor.execute("""
+            INSERT INTO schedule_feedback (schedule_id, teacher, content, created_at, updated_at)
+            VALUES (%s, %s, %s, TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'), TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
+            ON CONFLICT (schedule_id) DO UPDATE SET
+                content = EXCLUDED.content,
+                teacher = EXCLUDED.teacher,
+                updated_at = TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS')
+        """, (schedule_id, teacher, content))
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 # ==================== 全局设置（单课时时长等） ====================
@@ -1960,17 +2218,22 @@ def get_setting(key: str, default: str = "") -> str:
 
 
 def set_setting(key: str, value: str) -> None:
-    """写入全局设置项（UPSERT）"""
+    """写入全局设置项（UPSERT；单事务）"""
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO app_settings (key, value) VALUES (%s, %s)
-        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-    """, (key, value))
-    conn.commit()
-    if key == "lesson_minutes":
-        _cache_clear("lesson_minutes")
-    release_connection(conn)
+    try:
+        cursor.execute("""
+            INSERT INTO app_settings (key, value) VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """, (key, value))
+        conn.commit()
+        if key == "lesson_minutes":
+            _cache_clear("lesson_minutes")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
 
 def get_lesson_minutes() -> int:
@@ -2038,16 +2301,6 @@ def auto_consume_hours_by_feedback(schedule_id: int) -> Dict[str, Any]:
         return {"ok": False, "message": "计算课时为 0，无需扣减", "minutes": minutes, "hours": 0,
                 "customers": [], "skipped": []}
 
-    # 防重复：同一课表已自动扣减过则跳过
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id FROM course_records WHERE schedule_id = %s LIMIT 1", (schedule_id,))
-    if cursor.fetchone():
-        release_connection(conn)
-        return {"ok": False, "message": "该课表已自动扣减过课时，本次不再重复扣减",
-                "minutes": minutes, "hours": hours, "customers": [], "skipped": []}
-    release_connection(conn)
-
     # 扣减对象：1v1 课表直接挂学员；1v多 课表挂班级，扣全班学员
     class_id = s.get("class_id")
     customer_id = s.get("customer_id")
@@ -2074,55 +2327,106 @@ def auto_consume_hours_by_feedback(schedule_id: int) -> Dict[str, Any]:
     # 批量获取全部学员的「进行中」课时包，避免逐学员查询
     pkg_map = get_active_packages_for_customers([stu.get("customer_id") for stu in students])
     prefer_pkg_id = s.get("package_id") or 0  # 排课时指定的课时包（0=自动组合）
-    for stu in students:
-        cid = stu.get("customer_id")
-        name = stu.get("name") or f"学员#{cid}"
-        packages = pkg_map.get(cid) or []
-        if not packages:
-            skipped.append({"name": name, "reason": "无进行中课时包"})
-            continue
-        # 课时包类型匹配：优先用与课程同类型（1v1/1v多）的课时包；
-        # 兼容旧数据（历史课时包无类型、默认 1v1）：若学员没有同类型课时包，则回退用全部进行中课时包
-        course_type_safe = course_type if course_type in ("1v1", "1v多") else "1v1"
-        same_type = [p for p in packages if (p.get("type") or "1v1") == course_type_safe]
-        pool = same_type if same_type else packages
-        # 扣减顺序：排课指定课时包优先 → 剩余足够且最早到期 → 剩余最多
-        if prefer_pkg_id:
-            ordered = ([p for p in pool if p["id"] == prefer_pkg_id]
-                       + [p for p in pool if p["id"] != prefer_pkg_id])
-        else:
-            ordered = sorted(
-                pool,
-                key=lambda p: (0 if float(p.get("remaining_hours") or 0) >= hours else 1,
-                               p.get("expiry_date") or "",
-                               -float(p.get("remaining_hours") or 0)),
+
+    # 单事务：防重复检查 + 全班学员扣减在同一个事务中执行，
+    # 任一学员扣减失败则整体回滚，避免"部分学员已扣、部分未扣"的数据不一致。
+    conn = get_connection()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        # 防重复：同一课表已自动扣减过则跳过
+        cursor.execute("SELECT id FROM course_records WHERE schedule_id = %s LIMIT 1", (schedule_id,))
+        if cursor.fetchone():
+            conn.rollback()
+            return {"ok": False, "message": "该课表已自动扣减过课时，本次不再重复扣减",
+                    "minutes": minutes, "hours": hours, "customers": [], "skipped": []}
+
+        # 悲观锁：锁定本课表全部学员涉及的「进行中」课时包行（SELECT ... FOR UPDATE），
+        # 串行化并发扣减。并发事务会在此处阻塞等待，锁内重读保证基于最新剩余量计算。
+        pkg_ids = sorted({p["id"] for pkgs in pkg_map.values() for p in pkgs})
+        if pkg_ids:
+            cursor.execute(
+                "SELECT id, total_hours, used_hours FROM course_packages WHERE id = ANY(%s) FOR UPDATE",
+                (pkg_ids,),
             )
-        # 同类型课时包组合扣减：依次扣减，直到扣满本次课时
-        remain_need = hours
-        parts: List[Dict[str, Any]] = []
-        for p in ordered:
-            if remain_need <= 0:
-                break
-            rem = float(p.get("remaining_hours") or 0)
-            if rem <= 0:
+            locked = {r["id"]: r for r in cursor.fetchall()}
+            # 锁内重读：用加锁后的最新数据校正剩余课时，避免基于旧快照计算导致超扣
+            for pkgs in pkg_map.values():
+                for p in pkgs:
+                    live = locked.get(p["id"])
+                    p["remaining_hours"] = (
+                        float(live["total_hours"] - live["used_hours"]) if live else 0.0
+                    )
+
+        for stu in students:
+            cid = stu.get("customer_id")
+            name = stu.get("name") or f"学员#{cid}"
+            packages = pkg_map.get(cid) or []
+            if not packages:
+                skipped.append({"name": name, "reason": "无进行中课时包"})
                 continue
-            take = min(rem, remain_need)
-            parts.append({"pkg": p, "take": round(take, 2)})
-            remain_need = round(remain_need - take, 2)
-        if not parts:
-            skipped.append({"name": name, "reason": "同类型课时包剩余不足"})
-            continue
-        for part in parts:
-            add_course_record(
-                package_id=part["pkg"]["id"], customer_id=cid, record_date=record_date,
-                hours_used=part["take"], course_type=course_type, teacher=teacher,
-                notes=notes, schedule_id=schedule_id,
-            )
-        customers.append({
-            "name": name,
-            "package": " + ".join(p["pkg"].get("package_name") or "" for p in parts),
-            "hours": round(sum(p["take"] for p in parts), 2),
-        })
+            # 课时包类型匹配：优先用与课程同类型（1v1/1v多）的课时包；
+            # 兼容旧数据（历史课时包无类型、默认 1v1）：若学员没有同类型课时包，则回退用全部进行中课时包
+            course_type_safe = course_type if course_type in ("1v1", "1v多") else "1v1"
+            same_type = [p for p in packages if (p.get("type") or "1v1") == course_type_safe]
+            pool = same_type if same_type else packages
+            # 扣减顺序：排课指定课时包优先 → 剩余足够且最早到期 → 剩余最多
+            if prefer_pkg_id:
+                ordered = ([p for p in pool if p["id"] == prefer_pkg_id]
+                           + [p for p in pool if p["id"] != prefer_pkg_id])
+            else:
+                ordered = sorted(
+                    pool,
+                    key=lambda p: (0 if float(p.get("remaining_hours") or 0) >= hours else 1,
+                                   p.get("expiry_date") or "",
+                                   -float(p.get("remaining_hours") or 0)),
+                )
+            # 同类型课时包组合扣减：依次扣减，直到扣满本次课时
+            remain_need = hours
+            parts: List[Dict[str, Any]] = []
+            for p in ordered:
+                if remain_need <= 0:
+                    break
+                rem = float(p.get("remaining_hours") or 0)
+                if rem <= 0:
+                    continue
+                take = min(rem, remain_need)
+                parts.append({"pkg": p, "take": round(take, 2)})
+                remain_need = round(remain_need - take, 2)
+            if not parts:
+                skipped.append({"name": name, "reason": "同类型课时包剩余不足"})
+                continue
+            # 降级：用 SAVEPOINT 包裹该学员的扣减，若并发导致课时不足/课时包失效，
+            # 仅回滚该学员，不影响已扣减的其他学员（partial degrade）。
+            try:
+                cursor.execute("SAVEPOINT sp_auto_consume")
+                for part in parts:
+                    _insert_course_record(
+                        cursor, package_id=part["pkg"]["id"], customer_id=cid,
+                        record_date=record_date, hours_used=part["take"],
+                        course_type=course_type, teacher=teacher,
+                        notes=notes, schedule_id=schedule_id,
+                    )
+                cursor.execute("RELEASE SAVEPOINT sp_auto_consume")
+            except (RuntimeError, psycopg2.Error):
+                cursor.execute("ROLLBACK TO SAVEPOINT sp_auto_consume")
+                skipped.append({"name": name, "reason": "课时包剩余不足或已失效，未扣减"})
+                continue
+            customers.append({
+                "name": name,
+                "package": " + ".join(p["pkg"].get("package_name") or "" for p in parts),
+                "hours": round(sum(p["take"] for p in parts), 2),
+            })
+        conn.commit()
+    except psycopg2.errors.UniqueViolation:
+        # 并发竞态兜底：数据库唯一索引拦截了重复的 schedule_id，返回与主动查重一致的提示
+        conn.rollback()
+        return {"ok": False, "message": "该课表已自动扣减过课时，本次不再重复扣减",
+                "minutes": minutes, "hours": hours, "customers": [], "skipped": []}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_connection(conn)
 
     return {
         "ok": True,

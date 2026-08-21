@@ -426,17 +426,22 @@ with tab_map["tab_hours_records"]:
                     elif hours_used > selected_pkg["remaining_hours"]:
                         st.error(f"消耗课时({hours_used})超过剩余课时({selected_pkg['remaining_hours']:.1f})！")
                     else:
-                        add_course_record(
-                            package_id=selected_pkg["id"],
-                            customer_id=selected_pkg["customer_id"],
-                            record_date=record_date.strftime("%Y-%m-%d"),
-                            hours_used=hours_used,
-                            course_type=course_type,
-                            teacher=teacher.strip(),
-                            notes=rec_notes.strip(),
-                        )
-                        st.success(f"消课记录已添加！消耗 {hours_used} 课时。")
-                        st.rerun()
+                        try:
+                            add_course_record(
+                                package_id=selected_pkg["id"],
+                                customer_id=selected_pkg["customer_id"],
+                                record_date=record_date.strftime("%Y-%m-%d"),
+                                hours_used=hours_used,
+                                course_type=course_type,
+                                teacher=teacher.strip(),
+                                notes=rec_notes.strip(),
+                            )
+                        except RuntimeError as e:
+                            # 并发兜底：剩余课时被其他操作扣减后不足，条件更新拒绝
+                            st.error(f"消课失败：{e}")
+                        else:
+                            st.success(f"消课记录已添加！消耗 {hours_used} 课时。")
+                            st.rerun()
             else:
                 st.info("暂无进行中的课时包，请先为学员购买课时包（联系管理员）。")
 

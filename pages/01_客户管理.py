@@ -14,6 +14,7 @@ from database import (
     add_customer, update_customer, delete_customer,
     add_follow_up, get_follow_ups, update_follow_up, delete_follow_up,
     add_course_package, get_course_package_templates,
+    refresh_customer_stage_by_hours,
 )
 
 # ---------- 登录校验与权限守卫 ----------
@@ -108,15 +109,19 @@ def follow_up_dialog(cust):
 
 
 @st.dialog("📦 填写课时包信息", width="large",
-           on_dismiss=lambda: st.session_state.pop("pending_stage_customer", None))
-def course_package_dialog(cust):
-    """学员转为「在读」时，弹出对话框填写购买的课时包信息"""
+           on_dismiss=lambda: (st.session_state.pop("pending_stage_customer", None),
+                               st.session_state.pop("pending_renew_customer", None)))
+def course_package_dialog(cust, renew: bool = False):
+    """填写课时包信息：renew=False 为转「在读」报名；renew=True 为续费新增课时包（不改变生命周期阶段）"""
     cust_grade = (cust.get("grade") or "").strip()
     st.markdown(
-        f"**学员：** {cust['name']}　|　阶段：{cust['lifecycle_stage']} → **在读**　|　"
+        f"**学员：** {cust['name']}　|　阶段：{cust['lifecycle_stage']} → **{'续费' if renew else '在读'}**　|　"
         f"**年级：** {cust_grade or '（未填写）'}"
     )
-    st.caption("该学员将转入在读阶段，请填写其购买的课时包信息（仅显示当前年级对应的启用课时包）。")
+    if renew:
+        st.caption("为学员新增课时包完成续费（不改变当前阶段），请填写本次购买的课时包信息（仅显示当前年级对应的启用课时包）。")
+    else:
+        st.caption("该学员将转入在读阶段，请填写其购买的课时包信息（仅显示当前年级对应的启用课时包）。")
 
     # 预设课时包选择（在「课时管理 → 课时包」中维护），仅显示该年级或「不限年级」的启用模板
     templates = get_course_package_templates(status="启用", grade=cust_grade)
@@ -209,16 +214,24 @@ def course_package_dialog(cust):
                         unit_price=float(unit_price),
                         pkg_type=pkg_type,
                     )
-                    if cust.get("lifecycle_stage") != "在读":
-                        update_customer(cust["id"], lifecycle_stage="在读")
+                    if renew:
+                        # 续费后按剩余课时自动校正阶段：≥10 在读 / <10 待续费 / ≤0 流失
+                        new_stage = refresh_customer_stage_by_hours(cust["id"])
+                        stage_tip = f"（当前阶段：{new_stage}）" if new_stage else ""
+                        st.success(f"已为「{cust['name']}」新增课时包（{pkg_hours} 节），续费完成{stage_tip}！")
+                    else:
+                        if cust.get("lifecycle_stage") != "在读":
+                            update_customer(cust["id"], lifecycle_stage="在读")
+                        st.success(f"已为「{cust['name']}」保存课时包（{pkg_hours} 节），并转入在读！")
                     st.session_state.pop("pending_stage_customer", None)
-                    st.success(f"已为「{cust['name']}」保存课时包（{pkg_hours} 节），并转入在读！")
+                    st.session_state.pop("pending_renew_customer", None)
                     st.rerun()
                 else:
                     st.error("请填写课时包名称，且到手课时需大于 0")
     with b2:
         if st.button("⏭ 暂不填写", use_container_width=True):
             st.session_state.pop("pending_stage_customer", None)
+            st.session_state.pop("pending_renew_customer", None)
             st.rerun()
 
 
@@ -423,6 +436,8 @@ def customer_list_section():
         ops.append(("follow", "📝 跟进"))
     if can("action_customers_delete"):
         ops.append(("delete", "🗑 删除"))
+    if can("action_customers_pkg_add"):
+        ops.append(("renew", "💰 续费"))
     if can("action_customers_stage"):
         ops.append(("stage_prev", "⬅ 上一阶段"))
         ops.append(("stage_next", "➡ 下一阶段"))
@@ -442,6 +457,12 @@ def customer_list_section():
                     if st.button(label, use_container_width=True):
                         delete_customer(sel_id)
                         st.warning(f"已删除客户「{sel['name']}」")
+                        st.rerun()
+                elif op == "renew":
+                    if st.button(label, use_container_width=True):
+                        for _k in ("pkg_name", "pkg_hours", "pkg_price", "pkg_discount", "pkg_tpl_sel", "pkg_type"):
+                            st.session_state.pop(_k, None)
+                        st.session_state.pending_renew_customer = sel_id
                         st.rerun()
                 elif op == "stage_prev":
                     if st.button(label, use_container_width=True, disabled=current_idx <= 0):
@@ -522,7 +543,14 @@ def follow_up_section():
 # ---------- 主界面（选项卡按权限过滤） ----------
 st.title("👥 客户管理")
 
-# ---------- 在读学员课时包弹窗 ----------
+# ---------- 课时包弹窗（转在读报名 / 续费） ----------
+pending_renew_cust = st.session_state.get("pending_renew_customer")
+if pending_renew_cust:
+    renew_cust = get_customer_by_id(pending_renew_cust)
+    if renew_cust:
+        course_package_dialog(renew_cust, renew=True)
+    else:
+        st.session_state.pop("pending_renew_customer", None)
 pending_pkg_cust = st.session_state.get("pending_stage_customer")
 if pending_pkg_cust:
     pending_cust = get_customer_by_id(pending_pkg_cust)
