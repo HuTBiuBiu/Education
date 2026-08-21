@@ -17,15 +17,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ---------- 登录校验与用户栏 ----------
-if not current_user():
-    # 未登录：隐藏左侧选项栏，仅展示登录表单
-    # 注意：必须在耗时的 init_db 之前注入，否则侧边栏会先以展开状态闪现几秒
-    st.markdown(
-        '<style>[data-testid="stSidebar"]{display:none!important;}</style>',
-        unsafe_allow_html=True,
-    )
-
 # ---------- 初始化数据库 ----------
 # init_db 含建表/补列等 DDL，结果按小时缓存，避免每次界面操作都重复执行
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -34,8 +25,28 @@ def _init_db_cached() -> bool:
     return True
 
 
-_init_db_cached()
+# ---------- 登录校验与用户栏 ----------
+if not current_user():
+    # 未登录：隐藏左侧选项栏，仅展示登录表单
+    # 注意：必须在耗时的 init_db 之前注入，否则侧边栏会先以展开状态闪现几秒
+    st.markdown(
+        '<style>[data-testid="stSidebar"]{display:none!important;}</style>',
+        unsafe_allow_html=True,
+    )
+    # 关键修复：未登录时也必须显式调用 st.navigation()。
+    # 若只注入 CSS 而不注册导航，只要项目存在 pages/ 目录，Streamlit 在收不到
+    # st.navigation() 配置时就会回退到"自动页面导航"（auto-pages），
+    # 导致登录前的侧边栏依旧显示 01_客户管理、03_跟进提醒 等全部业务菜单。
+    # 这里仅注册一个隐藏的登录页（导航菜单为空），页面内容由 home.py 顶部的
+    # require_login() 渲染登录表单，登录后按角色权限重建导航。
+    _init_db_cached()
+    st.navigation(
+        [st.Page("home.py", title="登录", url_path="login", default=True, visibility="hidden")],
+        position="sidebar",
+    ).run()
+    st.stop()
 
+_init_db_cached()
 require_login()
 render_user_bar()
 
